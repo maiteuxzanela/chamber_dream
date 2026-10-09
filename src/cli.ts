@@ -62,7 +62,8 @@ async function main() {
     try {
       // Read events from the event table (session.compacted, session.updated, message.updated)
       const events = sqliteDb.query<
-        { id: string; aggregate_id: string; type: string; data: string; created: number }
+        { id: string; aggregate_id: string; type: string; data: string; created: number },
+        [string, number]
       >("SELECT id, aggregate_id, type, data, created FROM event WHERE type LIKE ? ORDER BY created DESC LIMIT ?")
         .all("%message.updated%", limit);
       
@@ -119,7 +120,8 @@ async function main() {
       if (entries === 0) {
         console.log("No events found, trying sessions table...");
         const sessions = sqliteDb.query<
-          { id: string; directory: string; title: string; time_created: number }
+          { id: string; directory: string; title: string; time_created: number },
+          [number]
         >("SELECT id, directory, title, time_created FROM session ORDER BY time_created DESC LIMIT ?").all(limit);
         
         for (const s of sessions) {
@@ -140,14 +142,14 @@ async function main() {
       // If still no entries, try generic approach
       if (entries === 0) {
         console.log("No sessions/events found, trying generic tables...");
-        const tableNames = sqliteDb.query("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
+        const tableNames = sqliteDb.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
         
         for (const table of tableNames) {
           try {
             // Check if table has relevant columns
-            const cols = sqliteDb.query(`PRAGMA table_info(${table})`).all().map((c: any) => c.name);
+            const cols = (sqliteDb.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(c => c.name);
             if (cols.includes("directory") || cols.includes("scope") || cols.includes("fact")) {
-              const rows = sqliteDb.query(`SELECT * FROM ${table} ORDER BY rowid DESC LIMIT ?`).all(limit);
+              const rows = sqliteDb.query<Record<string, unknown>, [number]>(`SELECT * FROM ${table} ORDER BY rowid DESC LIMIT ?`).all(limit);
               for (const row of rows) {
                 const rowObj: any = row;
                 const fact = rowObj.fact || rowObj.content || rowObj.value || JSON.stringify(rowObj).substring(0, 200);

@@ -1,38 +1,16 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { DreamsDB } from "./core/db";
 import { dream_learn, dream_recall } from "./tools";
-import fs from "fs";
-import path from "path";
-import os from "os";
 
 const db = new DreamsDB();
 
-const dailyDir = path.join(os.homedir(), ".config/opencode/dreams/daily");
-
-// DEF-05: sem constantes estáticas `dateStr`/`logFile` — o path é derivado da
-// data no momento de cada escrita, para sessões longas que atravessam a virada
-// da data não congelarem o log no arquivo do dia anterior.
-function getDailyLogPath(): string {
-  if (!fs.existsSync(dailyDir)) {
-    fs.mkdirSync(dailyDir, { recursive: true });
-  }
-  const dateStr = new Date().toISOString().split("T")[0];
-  return path.join(dailyDir, `log_${dateStr}.jsonl`);
-}
-
-// Helper to write event log entries
-function logEvent(entry: { type: string; scope?: string; fact: string; directory?: string; timestamp?: string }) {
-  const record = {
-    type: entry.type,
-    scope: entry.scope,
-    fact: entry.fact,
-    directory: entry.directory,
-    timestamp: entry.timestamp || new Date().toISOString()
-  };
-  fs.appendFileSync(getDailyLogPath(), JSON.stringify(record) + "\n");
-}
-
-export const serverPlugin: Plugin = async (input) => {
+// Hook de eventos LIMPO: a telemetria trivial de ciclo de vida
+// ("Sessão finalizada no diretório...", "Sessão compactada...",
+// "Sessão deletada...") foi REMOVIDA — eram spam sem valor preditivo
+// (DEF-10 já as classificava como triviais). O conteúdo real das conversas
+// agora é ingerido pelo Light Sleep via `session_reader` (leitura read-only
+// do opencode.db) e destilado pelo MimoSynthesizer no REM Sleep.
+export const serverPlugin: Plugin = async () => {
   return {
     tool: {
       dream_learn: tool({
@@ -60,43 +38,6 @@ export const serverPlugin: Plugin = async (input) => {
       }),
     },
 
-    event: async ({ event }) => {
-      // Ingestão passiva de eventos de sessão (apenas idle e compacted —
-// session.updated e message.updated foram removidos para evitar log spam
-// de centenas de eventos por minuto durante respostas do LLM).
-      if (event.type === "session.idle") {
-        const obs = {
-          type: event.type,
-          scope: "collective",
-          fact: `Sessão finalizada no diretório ${input.directory}`,
-          directory: input.directory,
-          category: "learning",
-          timestamp: new Date().toISOString()
-        };
-        fs.appendFileSync(getDailyLogPath(), JSON.stringify(obs) + "\n");
-      } else if (event.type === "session.deleted") {
-        const obs = {
-          type: event.type,
-          scope: "collective",
-          fact: `Sessão deletada no diretório ${input.directory}`,
-          directory: input.directory,
-          category: "learning",
-          timestamp: new Date().toISOString()
-        };
-        fs.appendFileSync(getDailyLogPath(), JSON.stringify(obs) + "\n");
-      } else if (event.type === "session.compacted") {
-        const obs = {
-          type: "session.compacted",
-          scope: "collective",
-          fact: `Sessão compactada no diretório ${input.directory}`,
-          directory: input.directory,
-          category: "learning",
-          timestamp: new Date().toISOString()
-        };
-        fs.appendFileSync(getDailyLogPath(), JSON.stringify(obs) + "\n");
-      }
-    },
-
     dispose: async () => {
       // DEF-09: libera a conexão SQLite (WAL) no unload do plugin.
       try {
@@ -104,7 +45,6 @@ export const serverPlugin: Plugin = async (input) => {
       } catch (e) {
         console.error("[Dreams] Failed to close DB on dispose:", e);
       }
-      return { status: "disposed", message: "Plugin disposed successfully" };
     }
   };
 };

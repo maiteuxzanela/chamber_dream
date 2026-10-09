@@ -142,6 +142,8 @@ export class DreamsDB {
             "UPDATE memories SET recall_count = recall_count + 1, last_reinforced = ? WHERE id = ?",
             [now, rec.id]
           );
+          rec.recall_count = (rec.recall_count || 0) + 1;
+          rec.last_reinforced = now;
         }
       }
       return records;
@@ -159,7 +161,19 @@ export class DreamsDB {
       }
       fallbackSql += " ORDER BY score DESC LIMIT ?";
       fallbackParams.push(limit);
-      return this.db.query<MemoryRecord, any[]>(fallbackSql).all(...fallbackParams);
+      const records = this.db.query<MemoryRecord, any[]>(fallbackSql).all(...fallbackParams);
+      const now = new Date().toISOString();
+      for (const rec of records) {
+        if (rec.id) {
+          this.db.run(
+            "UPDATE memories SET recall_count = recall_count + 1, last_reinforced = ? WHERE id = ?",
+            [now, rec.id]
+          );
+          rec.recall_count = (rec.recall_count || 0) + 1;
+          rec.last_reinforced = now;
+        }
+      }
+      return records;
     }
   }
 

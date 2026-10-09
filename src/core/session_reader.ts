@@ -1,0 +1,299 @@
+/**
+ * session_reader.ts — Leitura read-only das conversas recentes do OpenCode.
+ *
+ * Abre `~/.local/share/opencode/opencode.db` em modo SOMENTE LEITURA
+ * (`new Database(dbPath, { readonly: true })`) e extrai o diálogo textual
+ * das últimas N horas unindo as tabelas `message` e `part`.
+ *
+ * Regras de extração:
+ *  - Papel vindo de `message.data` → JSON `$.role` (`user` = instruções/pedidos/
+ *    feedbacks da usuária; `assistant` = respostas/ações do agente).
+ *  - Texto vindo de `part.data` → JSON `$.type === "text"` ou
+ *    `$.type === "reasoning"`, campo `$.text`.
+ *  - Ruído descartado: `type: "tool"` (payloads binários / saídas de bash
+ *    gigantescas), `step-start`, `step-finish`, `patch`, `file`, `compaction`.
+ *
+ * NUNCA lança exceção não tratada: banco inexistente, vazio, corrompido ou
+ * indisponível retornam `[]` (fail-soft; o erro é apenas repassado ao
+ * callback opcional `onError`, nunca propagado).
+ */
+import { Database } from "bun:sqlite";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+/** Papel do autor da mensagem dentro da sessão. */
+export type DialogRole = "user" | "assistant" | "system" | "other";
+
+/** Natureza textual do trecho extraído. */
+export type DialogKind = "text" | "reasoning";
+
+/** Um trecho do diálogo, já normalizado e agrupado por mensagem. */
+export interface DialogEntry {
+  /** ID da sessão OpenCode (`ses_...`). */
+  session_id: string;
+  /** ID da mensagem de origem (`msg_...`). */
+  message_id: string;
+  /** Autor: `user` (usuária) vs `assistant` (agente). */
+  role: DialogRole;
+  /** `text` = fala explícita; `reasoning` = raciocínio intermediário do agente. */
+  kind: DialogKind;
+  /** Conteúdo textual (possivelmente truncado em `maxTextLength`). */
+  text: string;
+  /** Timestamp da mensagem em epoch milliseconds. */
+  timestamp: number;
+  /** Timestamp da mensagem em ISO 8601 (UTC). */
+  time_iso: string;
+  /** `true` quando o texto foi cortado por `maxTextLength`. */
+  truncated: boolean;
+}
+
+/** Opções de leitura do diálogo recente. */
+export interface SessionReaderOptions {
+  /** Caminho do SQLite. Padrão: `~/.local/share/opencode/opencode.db`. */
+  dbPath?: string;
+  /** Janela de horas retroativas. Padrão: 24. */
+  hours?: number;
+  /** Corte absoluto em epoch ms (sobrepõe `hours`). */
+  sinceMs?: number;
+  /** Limite superior absoluto em epoch ms (padrão: agora). */
+  untilMs?: number;
+  /** Máximo de mensagens retornadas (padrão: 500). */
+  limit?: number;
+  /** Incluir partes `reasoning` além das `text`. Padrão: true. */
+  includeReasoning?: boolean;
+  /** Filtrar por papel específico (padrão: todos). */
+  role?: DialogRole;
+  /** Corte de caracteres por trecho; `0` ou `Infinity` desliga. Padrão: 4000. */
+  maxTextLength?: number;
+  /**
+   * Observabilidade opcional: recebe qualquer erro engolido pelo fail-soft.
+   * A função NUNCA lança — quem decide se o erro vira log é o chamador.
+   */
+  onError?: (error: unknown) => void;
+}
+
+/** Caminho padrão do banco de sessões do OpenCode. */
+export function defaultSessionDbPath(): string {
+  return path.join(os.homedir(), ".local/share/opencode/opencode.db");
+}
+
+/** Normaliza o papel vindo do JSON de `message.data`. */
+function normalizeRole(raw: unknown): DialogRole {
+  if (raw === "user" || raw === "assistant" || raw === "system") return raw;
+  return "other";
+}
+
+/** Trunca o texto em `max` caracteres, sinalizando o corte. */
+function truncateText(text: string, max: number): { text: string; truncated: boolean } {
+  if (!Number.isFinite(max) || max <= 0 || text.length <= max) {
+    return { text, truncated: false };
+  }
+  return { text: text.slice(0, max).trimEnd() + " …", truncated: true };
+}
+
+/**
+ * Lê o diálogo textual das últimas horas no SQLite do OpenCode.
+ *
+ * @returns Lista cronológica de trechos; `[]` se o banco não existir, estiver
+ *          vazio, corrompido ou a leitura falhar por qualquer motivo.
+ */
+export function readRecentDialogues(options: SessionReaderOptions = {}): DialogEntry[] {
+  const dbPath = options.dbPath || defaultSessionDbPath();
+  const hours = options.hours ?? 24;
+  const until = options.untilMs ?? Date.now();
+  const since = options.sinceMs ?? until - hours * 60 * 60 * 1000;
+  const limit = Math.max(1, options.limit ?? 500);
+  const includeReasoning = options.includeReasoning ?? true;
+  const maxTextLength = options.maxTextLength ?? 4000;
+
+  // Fail-soft: arquivo ausente ou vazio → lista vazia, sem exceção.
+  try {
+    if (!fs.existsSync(dbPath)) return [];
+    if (fs.statSync(dbPath).size === 0) return [];
+  } catch (error) {
+    options.onError?.(error);
+    return [];
+  }
+
+  let db: Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+
+    // 1) Mensagens da janela. Busca em ordem DECRESCENTE + LIMIT para reter as
+    //    mais RECENTES quando a janela excede o limite, depois inverte para
+    //    devolver a lista em ordem cronológica de leitura.
+    const messages = db
+      .query<
+        {
+          id: string;
+          session_id: string;
+          time_created: number;
+          role_raw: unknown;
+        },
+        [number, number, number]
+      >(
+        `SELECT m.id, m.session_id, m.time_created,
+                json_extract(m.data, '$.role') AS role_raw
+           FROM message m
+          WHERE m.time_created >= ? AND m.time_created <= ?
+          ORDER BY m.time_created DESC, m.id DESC
+          LIMIT ?`
+      )
+      .all(since, until, limit);
+    messages.reverse();
+
+    if (messages.length === 0) return [];
+
+    // 2) Partes textuais dessas mensagens (índice `part_message_id_id_idx`).
+    //    `json_valid` blinda contra JSON malformado isolado: a linha inválida é
+    //    descartada em vez de derrubar a consulta inteira. O filtro de kind vai
+    //    por parâmetro posicionado (?) — nada de interpolação de string no SQL.
+    //    Filtra exatamente pelos IDs das mensagens retornadas no primeiro select.
+    const msgIds = messages.map((m) => m.id);
+    const placeholders = msgIds.map(() => "?").join(",");
+    const rows = db
+      .query<
+        {
+          message_id: string;
+          ptype: string;
+          ptext: string;
+          ptime: number;
+          pid: string;
+        },
+        any[]
+      >(
+        `SELECT p.message_id,
+                json_extract(p.data, '$.type')  AS ptype,
+                json_extract(p.data, '$.text')  AS ptext,
+                p.time_created AS ptime,
+                p.id           AS pid
+           FROM part p
+          WHERE p.message_id IN (${placeholders})
+            AND json_valid(p.data)
+            AND (
+                  json_extract(p.data, '$.type') = 'text'
+                  OR (? = 1 AND json_extract(p.data, '$.type') = 'reasoning')
+                )
+            AND json_extract(p.data, '$.text') IS NOT NULL
+            AND TRIM(json_extract(p.data, '$.text')) <> ''
+          ORDER BY p.message_id, p.time_created ASC, p.id ASC`
+      )
+      .all(...msgIds, includeReasoning ? 1 : 0);
+
+    // 3) Agrupa as partes por mensagem E por kind, preservando a ordem
+    //    cronológica interna (o raciocínio vem antes da fala do agente).
+    const partsByMessage = new Map<string, { text: string[]; reasoning: string[] }>();
+    for (const row of rows) {
+      let bucket = partsByMessage.get(row.message_id);
+      if (!bucket) {
+        bucket = { text: [], reasoning: [] };
+        partsByMessage.set(row.message_id, bucket);
+      }
+      if (row.ptype === "reasoning") bucket.reasoning.push(row.ptext);
+      else bucket.text.push(row.ptext);
+    }
+
+    // 4) Emite no máximo 2 trechos por mensagem (um por kind), na ordem
+    //    raciocínio → fala, descartando mensagens sem texto textual útil
+    //    (ex.: mensagens compostas apenas por ferramentas/parts de ruído).
+    const entries: DialogEntry[] = [];
+    for (const msg of messages) {
+      const bucket = partsByMessage.get(msg.id);
+      if (!bucket) continue;
+
+      const role = normalizeRole(msg.role_raw);
+      if (options.role && role !== options.role) continue;
+
+      const timeline: { kind: DialogKind; pieces: string[] }[] = [
+        { kind: "reasoning", pieces: bucket.reasoning },
+        { kind: "text", pieces: bucket.text },
+      ];
+
+      for (const segment of timeline) {
+        if (segment.pieces.length === 0) continue;
+        const joined = segment.pieces.join("\n").trim();
+        if (!joined) continue;
+
+        const { text, truncated } = truncateText(joined, maxTextLength);
+        entries.push({
+          session_id: msg.session_id,
+          message_id: msg.id,
+          role,
+          kind: segment.kind,
+          text,
+          timestamp: msg.time_created,
+          time_iso: new Date(msg.time_created).toISOString(),
+          truncated,
+        });
+      }
+    }
+
+    return entries;
+  } catch (error) {
+    // Banco vazio, corrompido, bloqueado ou schema inesperado → fail-soft.
+    options.onError?.(error);
+    return [];
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* já fechado / nunca aberto */
+    }
+  }
+}
+
+/**
+ * Agrupa os trechos por sessão e produz um resumo textual conciso, pronto para
+ * ser injetado num prompt de síntese (outra camada do Dreams).
+ */
+export function summarizeDialogues(
+  entries: DialogEntry[],
+  options: { maxChars?: number; label?: string } = {}
+): string {
+  const maxChars = options.maxChars ?? 120_000;
+  if (entries.length === 0) return options.label ? `${options.label}: (sem diálogos)` : "";
+
+  const bySession = new Map<string, DialogEntry[]>();
+  for (const entry of entries) {
+    const bucket = bySession.get(entry.session_id);
+    if (bucket) bucket.push(entry);
+    else bySession.set(entry.session_id, [entry]);
+  }
+
+  const blocks: string[] = [];
+  for (const [sessionId, items] of bySession) {
+    const first = items[0];
+    const last = items[items.length - 1];
+    const lines: string[] = [
+      `# sessão ${sessionId} (${items.length} trecho(s), ${first.time_iso} → ${last.time_iso})`,
+    ];
+    for (const item of items) {
+      const marker = item.kind === "reasoning" ? "raciocínio" : item.role;
+      lines.push(`[${item.time_iso}] ${marker}: ${item.text.replace(/\s+/g, " ").trim()}`);
+    }
+    blocks.push(lines.join("\n"));
+  }
+
+  const full = blocks.join("\n\n");
+  if (full.length <= maxChars) return full;
+  // Truncamento invertido: fatiar o final da timeline com prefixo de omissão,
+  // garantindo que as mensagens mais recentes do final do dia NUNCA sejam perdidas.
+  const prefix = "[… início do dia omitido]\n\n";
+  const budget = Math.max(0, maxChars - prefix.length);
+  return prefix + full.slice(-budget).trimStart();
+}
+
+/**
+ * Atalho único: lê o diálogo recente e devolve o resumo textual pronto para
+ * prompt. Nunca lança exceção (retorna string vazia / aviso em caso de falha).
+ */
+export function readRecentDialogueSummary(options: SessionReaderOptions = {}): string {
+  try {
+    return summarizeDialogues(readRecentDialogues(options));
+  } catch (error) {
+    // Defesa extra: só é alcançável se o próprio summarizer falhar.
+    options.onError?.(error);
+    return "(session_reader indisponível)";
+  }
+}

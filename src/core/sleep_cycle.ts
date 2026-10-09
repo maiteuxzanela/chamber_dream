@@ -2,6 +2,12 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { DreamsDB, MemoryRecord } from "./db";
+import { readRecentDialogueSummary } from "./session_reader";
+import {
+  synthesizeMemories,
+  type SynthesisSource,
+  type SynthesizedMemory,
+} from "./mimo_synthesizer";
 
 // Diretório base padrão (produção). Testes injetam um baseDir isolado via options.
 const DEFAULT_DREAMS_DIR = path.join(os.homedir(), ".config/opencode/dreams");
@@ -12,6 +18,19 @@ const TRIVIAL_EVENT_TYPES = new Set(["session.idle", "session.deleted", "session
 // Nomes de agente aceitos em escopos `agent:<nome>` — bloqueia Directory Traversal (DEF-03).
 const SAFE_AGENT_NAME = /^[a-zA-Z0-9_-]+$/;
 
+/** Opções do ciclo de sono (todas opcionais; padrão = produção). */
+export interface SleepCycleOptions {
+  /** Diretório base isolado para testes (dreams dir). */
+  baseDir?: string;
+  /** Caminho do SQLite de sessões lido pelo Light Sleep.
+   *  Padrão: `~/.local/share/opencode/opencode.db`. */
+  sessionDbPath?: string;
+  /** Captura o diálogo recente no lightSleep. Padrão: true. */
+  captureDialogue?: boolean;
+  /** Janela de horas retroativas do diálogo. Padrão: 24. */
+  dialogueHours?: number;
+}
+
 export class SleepCycle {
   private db: DreamsDB;
   private lambda: number = 0.05; // Decay rate
@@ -20,13 +39,22 @@ export class SleepCycle {
   private dailyDir: string;
   private collectiveDir: string;
   private personasDir: string;
+  /** Arquivo de handoff Light -> REM com o resumo do diálogo recente. */
+  private dialogueFile: string;
+  private sessionDbPath: string | undefined;
+  private captureDialogue: boolean;
+  private dialogueHours: number;
 
-  constructor(db: DreamsDB, options?: { baseDir?: string }) {
+  constructor(db: DreamsDB, options?: SleepCycleOptions) {
     this.db = db;
     this.dreamsDir = options?.baseDir ? path.resolve(options.baseDir) : DEFAULT_DREAMS_DIR;
     this.dailyDir = path.join(this.dreamsDir, "daily");
     this.collectiveDir = path.join(this.dreamsDir, "collective");
     this.personasDir = path.join(this.dreamsDir, "personas");
+    this.dialogueFile = path.join(this.dreamsDir, "dialogue_pending.txt");
+    this.sessionDbPath = options?.sessionDbPath;
+    this.captureDialogue = options?.captureDialogue ?? true;
+    this.dialogueHours = options?.dialogueHours ?? 24;
     this.ensureDirs();
   }
 
@@ -79,7 +107,77 @@ export class SleepCycle {
     // TTL de 3 dias: varre DAILY_DIR e apaga arquivos .processed ou .jsonl
     // cuja mtime tenha mais que 3 dias.
     this.expireOldDailyFiles();
+
+    // Captura do diálogo real das últimas 24h no opencode.db (somente texto,
+    // sem raciocínio) para a destilação cognitiva do REM Sleep. Fail-soft:
+    // banco ausente/corrompido -> resumo vazio, o ciclo local não quebra.
+    this.captureRecentDialogue();
+
     console.log(`[Light Sleep] Ingested ${ingested} new facts.`);
+  }
+
+  /**
+   * Lê o diálogo recente (`session_reader`) e o persiste em
+   * `dialogue_pending.txt` como handoff para o REM Sleep — necessário porque
+   * o wrapper `bin/dreams-consolidate.sh` roda light/rem em processos separados.
+   */
+  private captureRecentDialogue() {
+    if (!this.captureDialogue) return;
+    try {
+      const summary = readRecentDialogueSummary({
+        dbPath: this.sessionDbPath,
+        hours: this.dialogueHours,
+        includeReasoning: false, // reasoning domina o volume e infla token
+        onError: (error) => console.error("[Light Sleep] session_reader:", error),
+      });
+      if (summary.trim() === "") {
+        console.log("[Light Sleep] Nenhum diálogo recente capturado.");
+        return;
+      }
+      fs.writeFileSync(this.dialogueFile, summary);
+      console.log(
+        `[Light Sleep] Diálogo recente capturado (${summary.length} chars) para o REM Sleep.`
+      );
+    } catch (error) {
+      // Fail-soft: a captura de diálogo nunca derruba a ingestão de logs.
+      console.error("[Light Sleep] Falha ao capturar diálogo recente:", error);
+    }
+  }
+
+  /**
+   * Consome o handoff do Light Sleep; se inexistente (REM isolado), lê o
+   * opencode.db diretamente. Devolve `""` quando não há diálogo.
+   */
+  private loadPendingDialogue(): string {
+    try {
+      if (fs.existsSync(this.dialogueFile)) {
+        const content = fs.readFileSync(this.dialogueFile, "utf-8");
+        if (content.trim() !== "") return content;
+      }
+    } catch (error) {
+      console.error("[REM Sleep] Falha ao ler dialogue_pending.txt:", error);
+    }
+    if (!this.captureDialogue) return "";
+    try {
+      return readRecentDialogueSummary({
+        dbPath: this.sessionDbPath,
+        hours: this.dialogueHours,
+        includeReasoning: false,
+        onError: (error) => console.error("[REM Sleep] session_reader:", error),
+      });
+    } catch (error) {
+      console.error("[REM Sleep] Falha ao ler diálogo direto:", error);
+      return "";
+    }
+  }
+
+  /** Remove o handoff após o consumo (evita re-sintetizar a mesma janela). */
+  private clearPendingDialogue() {
+    try {
+      if (fs.existsSync(this.dialogueFile)) fs.unlinkSync(this.dialogueFile);
+    } catch (error) {
+      console.error("[REM Sleep] Falha ao limpar dialogue_pending.txt:", error);
+    }
   }
 
   /**
@@ -106,67 +204,118 @@ export class SleepCycle {
   }
 
   /**
-   * REM Sleep: Reflective synthesis and DREAMS.md generation via LLM.
+   * REM Sleep: síntese cognitiva via cascata de IA (`opencode run --pure`),
+   * inserção das memórias destiladas no DreamsDB e geração do DREAMS.md.
+   *
+   * Fluxo:
+   *  1. consome o diálogo do Light Sleep (`dialogue_pending.txt`);
+   *  2. `synthesizeMemories(dialogue)` → array validado de memórias;
+   *  3. `db.insertMemory(scope, fact, category)` para cada memória;
+   *  4. escreve DREAMS.md e atualiza as projeções (COLLECTIVE/personas);
+   *  5. limpa o handoff apenas se a síntese tiver sucesso.
+   *
+   * Resiliência e anti-mock: sem IA disponível, o ciclo preserva
+   * `dialogue_pending.txt` intacto para o próximo ciclo tentar novamente,
+   * sem gravar memórias falsas ou dados inventados.
    */
   public async remSleep() {
     console.log("[REM Sleep] Synthesizing memories...");
-    const allMemories = this.db.getAllMemories();
-    if (allMemories.length === 0) return;
 
-    // We build a simple payload for the LLM
-    const prompt = `Synthesize these recent AI memories into a short human-readable diary:\n` + 
-                   allMemories.map(m => `- [${m.scope}] ${m.category}: ${m.fact}`).join("\n");
+    const dialogue = this.loadPendingDialogue();
+    let newMemories: SynthesizedMemory[] = [];
+    let source: SynthesisSource = "none";
+    let synthError: string | null = null;
+    let synthesisSucceeded = false;
 
-    let synthesis = "No synthesis generated (LLM API not configured).";
-    
-    // In a real Opencode plugin, we might use the plugin's LLM tools or fetch.
-    // For now, if OPENCODE_API_KEY is set, we could call standard endpoint.
-    // We will do a minimal fetch here if the key is available, else mock locally (but Clara says no mocks in tests, so we need a real implementation that doesn't fail if the API key isn't there, or returns a basic synthesis).
-    const apiKey = process.env.OPENCODE_API_KEY || process.env.GEMINI_API_KEY;
-    const model = process.env.OPENCODE_MODEL || "google/antigravity-gemini-3.1-pro";
-    // DEF-07: a verificação de internet é isolada exclusivamente para esta
-    // chamada remota da LLM. DREAMS_OFFLINE=1 força o caminho local (fallback),
-    // mantendo DREAMS.md e projeções funcionando sem rede.
-    const offline = process.env.DREAMS_OFFLINE === "1";
-
-    if (apiKey && !offline) {
+    if (dialogue.trim() !== "") {
       try {
-         // Assuming OpenAI compatible endpoint format for Opencode Mimo or standard Antigravity if it uses similar
-         // Since we don't know the exact endpoint, we'll write a placeholder fetch that works if endpoint is provided via env
-         const endpoint = process.env.OPENCODE_API_ENDPOINT || "https://api.openai.com/v1/chat/completions";
-         const res = await fetch(endpoint, {
-           method: "POST",
-           headers: {
-             "Content-Type": "application/json",
-             "Authorization": `Bearer ${apiKey}`
-           },
-           body: JSON.stringify({
-             model: model,
-             messages: [{role: "user", content: prompt}],
-             max_tokens: 500
-           })
-         });
-         if (res.ok) {
-           const data = await res.json() as any;
-           synthesis = data.choices?.[0]?.message?.content || synthesis;
-         } else {
-           console.error(`[REM Sleep] LLM API returned ${res.status}`);
-           synthesis = "Failed to generate synthesis due to API error.";
-         }
-      } catch (e) {
-         console.error("[REM Sleep] Error calling LLM API:", e);
+        const result = await synthesizeMemories(dialogue, {
+          onError: (error) => console.error("[REM Sleep] MimoSynthesizer:", error),
+        });
+        source = result.source;
+        synthError = result.error;
+        for (const mem of result.memories) {
+          this.db.insertMemory(mem.scope, mem.fact, mem.category);
+          newMemories.push(mem);
+        }
+        synthesisSucceeded = true;
+        console.log(
+          `[REM Sleep] Síntese ${source}: ${newMemories.length} memória(s) inserida(s)` +
+            `${result.dropped > 0 ? `, ${result.dropped} descartada(s)` : ""}` +
+            `${result.error ? ` — ${result.error}` : ""}.`
+        );
+      } catch (error) {
+        // Síntese adiada por indisponibilidade de IA: preserva dialogue_pending.txt e não grava dados falsos
+        synthError = error instanceof Error ? error.message : String(error);
+        console.warn(`[REM Sleep] Síntese cognitiva adiada por indisponibilidade de modelo: ${synthError}`);
       }
     } else {
-      console.log(offline
-        ? "[REM Sleep] Offline mode (DREAMS_OFFLINE=1). Using local fallback synthesis."
-        : "[REM Sleep] No API key found. Using fallback synthesis.");
-      synthesis = "Fallback Synthesis (No LLM key): \n" + allMemories.map(m => `- ${m.fact}`).join("\n");
+      console.log("[REM Sleep] Sem diálogo recente; usando memórias existentes.");
+      synthesisSucceeded = true;
     }
 
-    fs.writeFileSync(path.join(this.dreamsDir, "DREAMS.md"), `# Daily Dreams Synthesis\n\n${synthesis}\n`);
-    
+    const allMemories = this.db.getAllMemories();
+    if (allMemories.length === 0 && newMemories.length === 0 && !synthError) {
+      if (synthesisSucceeded) {
+        this.clearPendingDialogue();
+      }
+      console.log("[REM Sleep] Nenhuma memória para sintetizar.");
+      return;
+    }
+
+    fs.writeFileSync(
+      path.join(this.dreamsDir, "DREAMS.md"),
+      this.renderDreamsMarkdown({ source, synthError, newMemories, allMemories })
+    );
+
     // After REM, we update the collective and individual markdown files
     this.updateProjections();
+
+    // Limpa o handoff SOMENTE se a síntese foi bem-sucedida
+    if (synthesisSucceeded) {
+      this.clearPendingDialogue();
+    }
+  }
+
+  /** Renderiza o DREAMS.md de forma determinística a partir do resultado. */
+  private renderDreamsMarkdown(input: {
+    source: SynthesisSource;
+    synthError: string | null;
+    newMemories: SynthesizedMemory[];
+    allMemories: MemoryRecord[];
+  }): string {
+    const lines: string[] = ["# Daily Dreams Synthesis", ""];
+    const statusText = input.synthError
+      ? `**adiada** (${input.synthError})`
+      : `**${input.source}**`;
+    lines.push(
+      `> Gerado em ${new Date().toISOString()} — status da síntese: ${statusText}`
+    );
+    lines.push(
+      `> Memórias novas nesta síntese: ${input.newMemories.length} | total no banco: ${input.allMemories.length}`
+    );
+    lines.push("");
+
+    if (input.newMemories.length > 0) {
+      lines.push("## Memórias destiladas nesta síntese", "");
+      for (const mem of input.newMemories) {
+        lines.push(`- [${mem.category.toUpperCase()}] (${mem.scope}) ${mem.fact}`);
+      }
+      lines.push("");
+    }
+
+    const digest = [...input.allMemories]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 15);
+    if (digest.length > 0) {
+      lines.push("## Top memórias por score", "");
+      for (const mem of digest) {
+        lines.push(`- [${mem.category.toUpperCase()}] (${mem.scope}) ${mem.fact}`);
+      }
+      lines.push("");
+    }
+
+    return lines.join("\n");
   }
 
   /**
@@ -198,8 +347,8 @@ export class SleepCycle {
   }
 
   public updateProjections() {
-    // 1. Collective memory (limit 300 tokens approx, top 5-10 items)
-    const collective = this.db.getMemoriesByScope("collective", 5);
+    // 1. Collective memory (top 20 items mais relevantes por score)
+    const collective = this.db.getMemoriesByScope("collective", 20);
     let colContent = "<!-- COLLECTIVE MEMORY INJECTION (DO NOT EDIT) -->\n";
     collective.forEach(m => {
       colContent += `- [${m.category.toUpperCase()}] ${m.fact}\n`;
@@ -217,7 +366,7 @@ export class SleepCycle {
         console.warn(`[Projections] Skipping unsafe agent name: ${JSON.stringify(agent)}`);
         continue;
       }
-      const pMemories = this.db.getMemoriesByScope(`agent:${agent}`, 5);
+      const pMemories = this.db.getMemoriesByScope(`agent:${agent}`, 20);
       let pContent = `<!-- INDIVIDUAL MEMORY FOR ${agent.toUpperCase()} -->\n`;
       pMemories.forEach(m => {
         pContent += `- [${m.category.toUpperCase()}] ${m.fact}\n`;
