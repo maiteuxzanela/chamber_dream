@@ -115,7 +115,7 @@ export interface MimoSynthesizerOptions {
   timeoutMs?: number;
   /** Corte máximo do diálogo injetado no prompt (chars). Padrão: 120000. */
   maxDialogueChars?: number;
-  /** Limite de memórias retornadas. Padrão: 10. */
+  /** Limite de memórias retornadas. Padrão: 20. */
   maxMemories?: number;
   /** Diretório de trabalho do subprocesso. Padrão: cwd atual. */
   cwd?: string;
@@ -131,7 +131,7 @@ export interface MimoSynthesizerOptions {
  * Monta o prompt de destilação cognitiva. Instruções estritas: o modelo deve
  * responder SOMENTE com o array JSON (sem prosa, sem cercas markdown).
  */
-export function buildSynthesisPrompt(dialogue: string): string {
+export function buildSynthesisPrompt(dialogue: string, maxMemories: number = 20): string {
   return [
     "Você é o Destilador Cognitivo de Memórias do ecossistema OpenCode.",
     "Analise o diálogo passado abaixo e extraia APENAS lições aprendidas com valor preditivo para o futuro.",
@@ -142,7 +142,7 @@ export function buildSynthesisPrompt(dialogue: string): string {
     '3. "scope": "collective" para convenções gerais do ecossistema; "agent:<nome>" (nome apenas com letras, dígitos, hífen e sublinhado) para aprendizados de uma função/pessoa específica.',
     '4. "category": apenas um de "preference" | "decision" | "pitfall" | "learning".',
     '5. "fact": frase única em português, direta, entre 20 e 200 caracteres, no presente, sem IDs de sessão, caminhos temporários ou detalhes passageiros.',
-    "6. Máximo 10 memórias. Priorize correções da usuária, regras novas, armadilhas de framework e decisões arquiteturais duradouras.",
+    `6. Máximo ${maxMemories} memórias. Priorize correções da usuária, regras novas, armadilhas de framework e decisões arquiteturais duradouras.`,
     "7. Se não houver nenhuma lição útil, responda exatamente: []",
     "8. PROIBIDO inventar fatos que não estejam no diálogo.",
     "",
@@ -307,7 +307,7 @@ export function parseMimoMemories(
   raw: string,
   options: { maxMemories?: number } = {}
 ): { memories: SynthesizedMemory[]; dropped: number; parsed: boolean } {
-  const maxMemories = options.maxMemories ?? 10;
+  const maxMemories = options.maxMemories ?? 20;
   const candidates = tryParseJsonArrays(stripAnsi(raw ?? ""));
   if (candidates === null) {
     return { memories: [], dropped: 0, parsed: false };
@@ -452,7 +452,7 @@ export class MimoSynthesizer {
     this.timeoutMs =
       Number.isFinite(candidate) && candidate > 0 ? candidate : 180_000;
     this.maxDialogueChars = options.maxDialogueChars ?? 120_000;
-    this.maxMemories = options.maxMemories ?? 10;
+    this.maxMemories = options.maxMemories ?? 20;
     this.cwd = options.cwd;
     this.onError = options.onError;
   }
@@ -483,7 +483,7 @@ export class MimoSynthesizer {
       source.length > this.maxDialogueChars
         ? "[… início do dia omitido]\n\n" + source.slice(-this.maxDialogueChars).trimStart()
         : source;
-    const prompt = buildSynthesisPrompt(dialogueCapped);
+    const prompt = buildSynthesisPrompt(dialogueCapped, this.maxMemories);
 
     const modelsToTry: string[] =
       this.models.length > 0
