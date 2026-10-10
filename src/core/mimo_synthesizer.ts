@@ -27,6 +27,33 @@
  *    para uma nova tentativa futura.
  */
 import { spawn } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+/**
+ * Resolve o caminho absoluto do executável opencode CLI com fallbacks de diretório.
+ * Previne falhas sob ambientes com PATH mínimo (como systemd user services).
+ */
+export function resolveOpencodeBinaryPath(explicit?: string): string {
+  if (explicit && fs.existsSync(explicit)) return explicit;
+  if (process.env.OPENCODE_BIN && fs.existsSync(process.env.OPENCODE_BIN)) {
+    return process.env.OPENCODE_BIN;
+  }
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, ".opencode/bin/opencode"),
+    path.join(home, ".bun/bin/opencode"),
+    "/usr/local/bin/opencode",
+    "/usr/bin/opencode",
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return explicit || process.env.OPENCODE_BIN || "opencode";
+}
 
 /** Modelo padrão principal de destilação (cota gratuita; nunca deepseek/ollama). */
 export const DEFAULT_MIMO_MODEL = "opencode/mimo-v2.6-flash-free";
@@ -417,7 +444,7 @@ export class MimoSynthesizer {
     this.model = options.model || DEFAULT_MIMO_MODEL;
     this.fallbackModel = options.fallbackModel || DEFAULT_FALLBACK_MODEL;
     this.models = options.models && options.models.length > 0 ? options.models : [];
-    this.binary = options.binary || process.env.OPENCODE_BIN || "opencode";
+    this.binary = resolveOpencodeBinaryPath(options.binary);
     const envTimeout = Number(process.env.DREAMS_MIMO_TIMEOUT_MS);
     const candidate =
       options.timeoutMs ??

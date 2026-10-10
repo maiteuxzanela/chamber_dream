@@ -10,6 +10,8 @@
 LOG_FILE="$HOME/.local/state/opencode-dreams.log"
 exec >> "$LOG_FILE" 2>&1
 
+export PATH="$HOME/.opencode/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando consolidação diária de memórias (opencode-dreams)..."
 
 # 1. Checagem de conectividade (nunca aborta o ciclo local)
